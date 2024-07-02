@@ -20,6 +20,7 @@ void ringbuffer_init(rbctx_t *context, void *buffer_location,
   pthread_cond_init(&context->signal_write, NULL);
 }
 
+
 int ringbuffer_write(rbctx_t *context, void *message, size_t message_len) {
     struct timespec timeout;
     clock_gettime(CLOCK_REALTIME, &timeout);
@@ -30,39 +31,34 @@ int ringbuffer_write(rbctx_t *context, void *message, size_t message_len) {
     size_t total_space = context->end - context->begin;
     size_t space_needed = message_len + sizeof(size_t);
 
-    if (space_needed > total_space) {
-        pthread_mutex_unlock(&context->mutex_write);
-        return RINGBUFFER_FULL;
-    }
-
-    size_t available_space;
-    if (context->write >= context->read) {
-        available_space = (context->end - context->write) + (context->read - context->begin) - 1;
-    } else {
-        available_space = context->read - context->write - 1;
-    }
-
-    while (available_space < space_needed) {
-        int res = pthread_cond_timedwait(&context->signal_write, &context->mutex_write, &timeout);
-        if (res == ETIMEDOUT) {
+    while (1) {
+        if (space_needed > total_space) {
             pthread_mutex_unlock(&context->mutex_write);
-            return RBUF_TIMEOUT;
+            return RINGBUFFER_FULL;
         }
 
+        size_t available_space;
         if (context->write >= context->read) {
             available_space = (context->end - context->write) + (context->read - context->begin) - 1;
         } else {
             available_space = context->read - context->write - 1;
         }
+
+        if (available_space >= space_needed) {
+            break;
+        }
+
+        int res = pthread_cond_timedwait(&context->signal_write, &context->mutex_write, &timeout);
+        if (res == ETIMEDOUT) {
+            pthread_mutex_unlock(&context->mutex_write);
+            return RBUF_TIMEOUT;
+        }
     }
 
+    // Write message length
     if (context->write + sizeof(size_t) <= context->end) {
         memcpy(context->write, &message_len, sizeof(size_t));
         context->write += sizeof(size_t);
-
-        if (context->write == context->end) {
-            context->write = context->begin;
-        }
     } else {
         size_t first_part_size = context->end - context->write;
         memcpy(context->write, &message_len, first_part_size);
@@ -70,13 +66,10 @@ int ringbuffer_write(rbctx_t *context, void *message, size_t message_len) {
         context->write = context->begin + (sizeof(size_t) - first_part_size);
     }
 
+    // Write message content
     if (context->write + message_len <= context->end) {
         memcpy(context->write, message, message_len);
         context->write += message_len;
-
-        if (context->write == context->end) {
-            context->write = context->begin;
-        }
     } else {
         size_t first_part_size = context->end - context->write;
         memcpy(context->write, message, first_part_size);
@@ -86,6 +79,7 @@ int ringbuffer_write(rbctx_t *context, void *message, size_t message_len) {
 
     pthread_cond_signal(&context->signal_read);
     pthread_mutex_unlock(&context->mutex_write);
+
     return SUCCESS;
 }
 
@@ -119,6 +113,7 @@ int ringbuffer_read(rbctx_t *context, void *buffer, size_t *buffer_len) {
     timeout.tv_sec += 1;
 
     pthread_mutex_lock(&context->mutex_read);
+
     while (context->read == context->write) {
         int res = pthread_cond_timedwait(&context->signal_read, &context->mutex_read, &timeout);
         if (res == ETIMEDOUT) {
@@ -155,7 +150,6 @@ int ringbuffer_read(rbctx_t *context, void *buffer, size_t *buffer_len) {
     *buffer_len = size;
     return SUCCESS;
 }
-
 void ringbuffer_destroy(rbctx_t *context) {
     pthread_mutex_destroy(&context->mutex_read);
     pthread_mutex_destroy(&context->mutex_write);
