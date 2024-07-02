@@ -21,7 +21,69 @@ void ringbuffer_init(rbctx_t *context, void *buffer_location,
 }
 
 int ringbuffer_write(rbctx_t *context, void *message, size_t message_len) {
-  /* your solution here */
+  pthread_mutex_lock(&context->mutex_write);
+
+  size_t total_space = context->end - context->begin;
+  size_t available_space = context->end - context->write;
+  size_t space_needed = message_len + sizeof(size_t);
+
+  if (space_needed > total_space)
+    return RINGBUFFER_FULL;
+
+  // check if there is Enough space before the end of the buffer
+  if (available_space >= space_needed) {
+    // write the length of the message
+    size_t *len_ptr = (size_t *)context->write;
+    *len_ptr = message_len;
+    context->write += sizeof(message_len);
+    // write message data
+    memcpy(context->write, message, message_len);
+    context->write += message_len; // move write pointer to after the message
+
+    if (context->write == context->end)
+      context->write = context->begin;
+    // signal that data has been written
+    pthread_cond_signal(&context->signal_write);
+  } else {
+    // if the the available space less than the space we need to write
+    // write message length
+    if (available_space < sizeof(message_len)) {
+      size_t first_chunk_size = available_space;
+      size_t second_chunk_size = sizeof(message_len) - first_chunk_size;
+
+      memcpy(context->write, &message_len, first_chunk_size);
+      context->write = context->begin + second_chunk_size;
+    } else {
+      size_t *len_ptr = (size_t *)context->write;
+      *len_ptr = message_len;
+      context->write += message_len;
+    }
+
+    // recalculate space available
+    available_space = context->end - context->write;
+
+    if (available_space < message_len) {
+
+      // write message data
+      size_t first_chunk_size = available_space;
+      size_t second_chunk_size = space_needed - available_space;
+
+      // TODO: do not overtake read ptr, check this shit please
+      memcpy(context->write, message, first_chunk_size);
+      memcpy(context->begin, message + first_chunk_size, second_chunk_size);
+
+      context->write = context->begin + second_chunk_size;
+    } else {
+      // write message data
+      memcpy(context->write, message, message_len);
+      context->write += message_len; // move write pointer to after the message
+    }
+    // signal that data has been written
+    pthread_cond_signal(&context->signal_write);
+  }
+
+  pthread_mutex_unlock(&context->mutex_write);
+  return SUCCESS;
 }
 
 size_t read_message_size_from_ringbuffer(rbctx_t *context) {
