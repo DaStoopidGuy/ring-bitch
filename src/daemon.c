@@ -32,9 +32,6 @@ typedef struct {
   connection_t *connection;
 } w_thread_args_t;
 
-pthread_mutex_t ring_buffer_mutex;
-pthread_cond_t ring_buffer_cond = PTHREAD_COND_INITIALIZER;
-
 void *write_packets(void *arg) {
   /* extract arguments */
   rbctx_t *ctx = ((w_thread_args_t *)arg)->ctx;
@@ -77,16 +74,32 @@ void *write_packets(void *arg) {
 
 pthread_mutex_t file_mutexes[MAXIMUM_PORT];
 char *destination_file_names[MAXIMUM_PORT];
+pthread_mutex_t filter_mutex = PTHREAD_MUTEX_INITIALIZER;
 // Filtering function
 int should_filter(size_t from_port, size_t to_port, char *message_content) {
-  if (from_port == to_port || from_port == 42 || to_port == 42 ||
-      (from_port + to_port) == 42 ||
-      strstr(message_content, "malicious") != NULL) {
-    return 1; // Message should be filtered out
+  int filter = 0;
+  if (message_content != NULL) {
+    // Check for "malicious" with possible characters in between
+    pthread_mutex_lock(&filter_mutex);
+    const char *pattern = "malicious";
+    size_t pattern_index = 0;
+
+    for (size_t i = 0; message_content[i] != '\0'; i++) {
+      if (message_content[i] == pattern[pattern_index]) {
+        pattern_index++;
+        if (pattern[pattern_index] == '\0') {
+          // Full pattern matched!
+          filter = 1; // Filter out
+        }
+      }
+    }
+    pthread_mutex_unlock(&filter_mutex);
   }
-  return 0; // Message should be processed
+  return filter;
 }
 
+pthread_mutex_t ring_buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t ring_buffer_cond = PTHREAD_COND_INITIALIZER;
 // File writing function
 void write_to_file(size_t port, const char *message_content,
                    const size_t message_len) {
@@ -128,8 +141,6 @@ void *read_packets(void *arg) {
     // Extract message content
     char *message_content = (char *)(buf + 3 * sizeof(size_t));
     size_t message_len = read_len - 3 * sizeof(size_t);
-    printf("%s", message_content);
-    printf("\n");
     // Implement filtering
     if (should_filter(from_port, to_port, message_content)) {
       // Discard message based on filtering criteria
@@ -202,6 +213,7 @@ int simpledaemon(connection_t *connections, int nr_of_connections) {
   }
 
   pthread_mutex_init(&ring_buffer_mutex, NULL);
+  pthread_mutex_init(&filter_mutex, NULL);
   // STARTING READER THREADS
 
   for (int i = 0; i < NUMBER_OF_PROCESSING_THREADS; i++) {
