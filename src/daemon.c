@@ -72,12 +72,13 @@ void *write_packets(void *arg) {
 
 /********************************************************************/
 
-pthread_mutex_t file_mutexes[MAXIMUM_PORT];
-char *destination_file_names[MAXIMUM_PORT];
 pthread_mutex_t filter_mutex = PTHREAD_MUTEX_INITIALIZER;
 // Filtering function
 int should_filter(size_t from_port, size_t to_port, char *message_content) {
   int filter = 0;
+  if (from_port == 42 || to_port == 42 || (from_port + to_port) == 42) {
+    filter = 1;
+  }
   if (message_content != NULL) {
     // Check for "malicious" with possible characters in between
     pthread_mutex_lock(&filter_mutex);
@@ -93,65 +94,94 @@ int should_filter(size_t from_port, size_t to_port, char *message_content) {
         }
       }
     }
-    pthread_mutex_unlock(&filter_mutex);
+      pthread_mutex_unlock(&filter_mutex);
+    }
+    return filter;
   }
-  return filter;
-}
 
-pthread_mutex_t ring_buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t ring_buffer_cond = PTHREAD_COND_INITIALIZER;
-// File writing function
-void write_to_file(size_t port, const char *message_content,
-                   const size_t message_len) {
-  // Thread-safe write to file using mutex
-  pthread_mutex_lock(&file_mutexes[port]);
-  FILE *fp = fopen(destination_file_names[port], "a");
-  if (fp != NULL) {
-    fwrite(message_content, 1, message_len, fp);
-    fclose(fp);
+  pthread_mutex_t file_mutexes[MAXIMUM_PORT];
+  char *destination_file_names[MAXIMUM_PORT];
+  pthread_mutex_t ring_buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
+  pthread_mutex_t processing_mutex = PTHREAD_MUTEX_INITIALIZER;
+  pthread_cond_t write_condition[MAXIMUM_PORT] = PTHREAD_COND_INITIALIZER;
+  int is_writing[MAXIMUM_PORT] = {0};
+
+  // File writing function
+  void write_to_file(size_t port, const char *message_content,
+                     const size_t message_len) {
+    pthread_mutex_lock(&file_mutexes[port]);
+
+  //Waiting until no other thread is writing to this port
+  while(is_writing[port]){
+      pthread_cond_wait(&write_condition[port],&file_mutexes[port]);
+    }
+  is_writing[port] = 1;
+    FILE *fp = fopen(destination_file_names[port], "a");
+
+    if (fp != NULL) {
+      printf("[Thread %ld] Writing %zu bytes to file %s\n", pthread_self(),
+             message_len, destination_file_names[port]);
+      size_t bytes_written = fwrite(message_content, 1, message_len, fp);
+      if (bytes_written != message_len) {
+        printf("[Thread %ld] ERROR: Wrote only %zu bytes (expected %zu) to file "
+               "%s\n",
+               pthread_self(), bytes_written, message_len,
+               destination_file_names[port]);
+      }
+      fclose(fp);
+    } else {
+      printf("[Thread %ld] ERROR: Could not open file %s\n", pthread_self(),
+             destination_file_names[port]);
+    }
+    is_writing[port]  = 0;
+    pthread_cond_broadcast(&write_condition[port]);
+    pthread_mutex_unlock(&file_mutexes[port]);
   }
-  pthread_mutex_unlock(&file_mutexes[port]);
-}
 
-void *read_packets(void *arg) {
-  rbctx_t *ctx = (rbctx_t *)arg;
-  pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-  pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
-  while (1) {
-    pthread_testcancel();
+  void *read_packets(void *arg) {
+    rbctx_t *ctx = (rbctx_t *)arg;
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
     unsigned char buf[MESSAGE_SIZE];
-    size_t read_len = MESSAGE_SIZE;
+    while (1) {
+      pthread_testcancel();
 
-    pthread_mutex_lock(&ring_buffer_mutex);
-    int result = ringbuffer_read(ctx, buf, &read_len);
-    pthread_mutex_unlock(&ring_buffer_mutex);
-    if (result == RINGBUFFER_EMPTY) {
-      continue;
-    } else if (result == -1) {
-      // Handle buffer too small condition
-      continue;
+      size_t read_len = MESSAGE_SIZE;
+
+      pthread_mutex_lock(&ring_buffer_mutex);
+      int result = ringbuffer_read(ctx, buf, &read_len);
+      pthread_mutex_unlock(&ring_buffer_mutex);
+
+      if (result == RINGBUFFER_EMPTY) {
+        continue;
+      } else if (result == -1) {
+        // Handle buffer too small condition
+        continue;
+      }
+
+      pthread_mutex_lock(&processing_mutex);
+      // Extract metadata from the packet
+      size_t from_port, to_port, packet_id;
+      memcpy(&from_port, buf, sizeof(size_t));
+      memcpy(&to_port, buf + sizeof(size_t), sizeof(size_t));
+      memcpy(&packet_id, buf + 2 * sizeof(size_t), sizeof(size_t));
+
+      // Extract message content
+      char *message_content = (char *)(buf + 3 * sizeof(size_t));
+      size_t message_len = read_len - 3 * sizeof(size_t);
+      // Implement filtering
+      if (should_filter(from_port, to_port, message_content)) {
+        // Discard message based on filtering criteria
+        pthread_mutex_unlock(&processing_mutex);
+        continue;
+      }
+      pthread_mutex_unlock(&processing_mutex);
+
+      write_to_file(to_port, message_content, message_len);
+      // Write message content to destination file
     }
 
-    // Extract metadata from the packet
-    size_t from_port, to_port, packet_id;
-    memcpy(&from_port, buf, sizeof(size_t));
-    memcpy(&to_port, buf + sizeof(size_t), sizeof(size_t));
-    memcpy(&packet_id, buf + 2 * sizeof(size_t), sizeof(size_t));
-
-    // Extract message content
-    char *message_content = (char *)(buf + 3 * sizeof(size_t));
-    size_t message_len = read_len - 3 * sizeof(size_t);
-    // Implement filtering
-    if (should_filter(from_port, to_port, message_content)) {
-      // Discard message based on filtering criteria
-      continue;
-    }
-
-    // Write message content to destination file
-    write_to_file(to_port, message_content, message_len);
-  }
-
-  return NULL;
+    return NULL;
 }
 
 /* YOUR CODE ENDS HERE */
@@ -212,8 +242,6 @@ int simpledaemon(connection_t *connections, int nr_of_connections) {
     sprintf(destination_file_names[i], "%d.txt", i);
   }
 
-  pthread_mutex_init(&ring_buffer_mutex, NULL);
-  pthread_mutex_init(&filter_mutex, NULL);
   // STARTING READER THREADS
 
   for (int i = 0; i < NUMBER_OF_PROCESSING_THREADS; i++) {
@@ -258,6 +286,8 @@ int simpledaemon(connection_t *connections, int nr_of_connections) {
   }
 
   pthread_mutex_destroy(&ring_buffer_mutex);
+  pthread_mutex_destroy(&filter_mutex);
+  pthread_mutex_destroy(&processing_mutex);
   /* YOUR CODE ENDS HERE */
 
   /********************************************************************/
